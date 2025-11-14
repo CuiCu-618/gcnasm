@@ -17,13 +17,13 @@ The program prints an aligned table per variant:
 ```
 ./matrix_multiplication
 > Device: AMD Instinct MI300A | Arch: gfx942:sramecc+:xnack- | CUs: 228
-GEMM: [2048x4096] * [4096x2048], tiles: [64x64], block: 32x32, reps: 100, check: on
+GEMM: [2048x4096] * [4096x2048], tiles: [16x16], block: 128x128, reps: 100, check: on
 
-Variant          |     Avg ms |    TFLOP/s |  GB/s(min) |   Reps |    Blk | Check
------------------+------------+------------+------------+--------+--------+------
-tiled            |    10.4814 |      3.278 |      7.454 |    100 |  32x32 |   YES
-+ swizzle        |     9.3270 |      3.684 |      8.376 |    100 |  32x32 |   YES
-+ swzl + regs    |     1.9475 |     17.643 |     40.116 |    100 |  32x32 |   YES
+Variant              |     Avg ms |    TFLOP/s |  GB/s(min) |   Reps |    Blk | Check
+---------------------+------------+------------+------------+--------+--------+------
+tiled                |    11.0538 |      3.108 |      7.068 |    100 |  32x32 |   YES
++ swizzle            |     4.3594 |      7.882 |     17.921 |    100 |  32x32 |   YES
++ swzl + regs (nt)   |     1.9055 |     18.031 |     40.999 |    100 |  32x32 |   YES
 
 Validation passed.
 ```

@@ -261,6 +261,104 @@ __global__ void gemm_tiled_regs(const float *__restrict__ A,
     }
   }
 }
+#undef TILE_K
+
+
+#define TILE_K 32
+#define WARP_M 16
+#define WARP_N 16
+#define WARP_K 16
+
+#define WARP_GROUP 256
+
+__global__ void gemm_tiled_regs_nt(const float *__restrict__ A,
+                                const float *__restrict__ B, float *C,
+                                unsigned wAB, unsigned wC) {
+  // Block index
+  const int grid_size    = gridDim.x * gridDim.y;
+  const int linear_bid   = blockIdx.x + blockIdx.y * gridDim.x;
+  const int remapped_bid = remap_xcd(linear_bid, grid_size);
+  const int bx           = remapped_bid % gridDim.x;
+  const int by           = remapped_bid / gridDim.x;
+
+  constexpr int elem_per_thread = 16 / sizeof(float);
+  constexpr int threads_per_row = TILE_K / elem_per_thread;
+  constexpr int threads_per_col = WARP_GROUP / threads_per_row;
+  constexpr int n_reps_A = TILE_M / threads_per_col;
+  constexpr int n_reps_B = TILE_N / threads_per_col;
+
+  constexpr int swizzle_base = TILE_K / 4;
+
+  int a_begin = wAB * TILE_M * by;
+  int a_end = a_begin + wAB - 1;
+  int a_step = TILE_K;
+
+  int b_begin = wAB * TILE_N * bx;
+  int b_step = TILE_K;
+
+  // Thread index
+  int tidx = threadIdx.x % threads_per_row;
+  int tidy = threadIdx.x / threads_per_row;
+
+  // Thread index for local computation
+  int tx = threadIdx.x % WARP_M;
+  int ty = threadIdx.x / WARP_N;
+
+  float regC[TILE_M / WARP_M][TILE_N / WARP_N] = {{0}};
+
+  // Loop over all the sub-matrices of A and B
+  // required to compute the block sub-matrix
+  for (int a = a_begin, b = b_begin; a <= a_end; a += a_step, b += b_step) {
+
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_N][TILE_K];
+
+    #pragma unroll
+    for (int i = 0; i < n_reps_A; ++i)
+      *((fp32x4_t *)&As[tidy + i * threads_per_col][tidx * elem_per_thread]) = 
+            *((fp32x4_t *)&A[a + wAB * (tidy + i * threads_per_col) + tidx * elem_per_thread]);
+
+    #pragma unroll
+    for (int i = 0; i < n_reps_B; ++i)
+      *((fp32x4_t *)&Bs[tidy + i * threads_per_col][tidx * elem_per_thread]) = 
+            *((fp32x4_t *)&B[a + wAB * (tidy + i * threads_per_col) + tidx * elem_per_thread]);
+    __syncthreads();
+
+    float regAs[TILE_M / WARP_M];
+    float regBs[TILE_N / WARP_N];
+
+    // Load the shared memory sub-matrices into registers
+    for (int i = 0; i < TILE_K; i++) {
+
+    #pragma unroll
+      for (int ii = 0; ii < TILE_M / WARP_M; ++ii) 
+        regAs[ii] = As[ty + ii * WARP_M][i];
+
+    #pragma unroll
+      for (int ii = 0; ii < TILE_N / WARP_N; ++ii) 
+        regBs[ii] = Bs[tx + ii * WARP_N][i];
+
+      // Multiply the two matrices together;
+      // each thread computes one element
+      for (int ii = 0; ii < TILE_M / WARP_M; ++ii) {
+        for (int jj = 0; jj < TILE_N / WARP_N; jj++) {
+          regC[ii][jj] += regAs[ii] * regBs[jj];
+        }
+      }
+    }
+
+    __syncthreads();
+  }
+
+  // Write the computed values to the output matrix C
+  int c = wC * TILE_N * by + TILE_M * bx;
+  for (int i = 0; i < TILE_M / WARP_M; i++) {
+    for (int j = 0; j < TILE_N / WARP_N; j++) {
+      C[c + wC * (ty + i * WARP_M) + (tx + j * WARP_N)] = regC[i][j];
+    }
+  }
+}
+
 
 // ----- Metrics helpers -----
 static inline double tflops(double m, double n, double k, double ms) {
@@ -297,7 +395,14 @@ void launch_tiled_regs(unsigned C_rows, unsigned C_cols, const float *A,
                       const float *B, float *C, unsigned K) {
   const dim3 block(256);
   const dim3 grid(C_cols / TILE_N, C_rows / TILE_M);
-  gemm_tiled_regs<<<grid, 256>>>(A, B, C, K, C_cols);
+  gemm_tiled_regs<<<grid, block>>>(A, B, C, K, C_cols);
+}
+
+void launch_tiled_regs_nt(unsigned C_rows, unsigned C_cols, const float *A,
+                      const float *B, float *C, unsigned K) {
+  const dim3 block(WARP_GROUP);
+  const dim3 grid(C_cols / TILE_N, C_rows / TILE_M);
+  gemm_tiled_regs<<<grid, block>>>(A, B, C, K, C_cols);
 }
 
 int main(int argc, const char *argv[]) {
@@ -335,8 +440,8 @@ int main(int argc, const char *argv[]) {
             << " | CUs: " << prop.multiProcessorCount << "\n";
 
   std::cout << "GEMM: [" << M << 'x' << K << "] * [" << K << 'x' << N
-            << "], tiles: [" << C_rows / BS << "x" << C_cols / BS
-            << "], block: " << BS << 'x' << BS << ", reps: " << reps
+            << "], tiles: [" << C_rows / TILE_N << "x" << C_cols / TILE_M
+            << "], block: " << TILE_N << "x" << TILE_M << ", reps: " << reps
             << ", check: " << (do_check ? "on" : "off") << "\n\n";
 
   // Host data (A=1, B=const => C=K*const)
@@ -366,7 +471,8 @@ int main(int argc, const char *argv[]) {
   Variant variants[] = {
       {"tiled", &launch_tiled<BS>},
       {"+ swizzle", &launch_tiled_swizzle<BS>},
-      {"+ swzl + regs", &launch_tiled_regs},
+      // {"+ swzl + regs", &launch_tiled_regs},
+      {"+ swzl + regs (nt)", &launch_tiled_regs_nt},
   };
 
   // Timing infra
@@ -375,10 +481,10 @@ int main(int argc, const char *argv[]) {
   HIP_CHECK(hipEventCreate(&ev_stop));
 
   // Header
-  std::printf("%-16s | %10s | %10s | %10s | %6s | %6s | %5s\n", "Variant",
+  std::printf("%-20s | %10s | %10s | %10s | %6s | %6s | %5s\n", "Variant",
               "Avg ms", "TFLOP/s", "GB/s(min)", "Reps", "Blk", "Check");
-  std::printf("%-16s-+-%10s-+-%10s-+-%10s-+-%6s-+-%6s-+-%5s\n",
-              std::string(16, '-').c_str(), std::string(10, '-').c_str(),
+  std::printf("%-20s-+-%10s-+-%10s-+-%10s-+-%6s-+-%6s-+-%5s\n",
+              std::string(20, '-').c_str(), std::string(10, '-').c_str(),
               std::string(10, '-').c_str(), std::string(10, '-').c_str(),
               std::string(6, '-').c_str(), std::string(6, '-').c_str(),
               std::string(5, '-').c_str());
@@ -423,7 +529,7 @@ int main(int argc, const char *argv[]) {
       all_ok &= ok;
     }
 
-    std::printf("%-16s | %10.4f | %10.3f | %10.3f | %6d |  %2ux%2u | %5s%s\n",
+    std::printf("%-20s | %10.4f | %10.3f | %10.3f | %6d |  %2ux%2u | %5s%s\n",
                 v.name, ms_avg, tfs, gbps, reps, BS, BS,
                 do_check ? "YES" : "NO", (do_check && !ok) ? " *FAIL*" : "");
   }
