@@ -443,28 +443,6 @@ __device__ void topk_per_row_kernel(const float *logits, const int rowStart,
   }
 }
 
-namespace details {
-#if defined(__gfx942__)
-#define N_XCD 6
-#elif defined(__gfx950__)
-#define N_XCD 8
-#else
-#define N_XCD 1
-#endif
-
-static inline __device__ int remap_block_id(int linear_bid, int grid_sz) {
-  const int bucket = linear_bid % N_XCD;
-  const int max_buckets = (grid_sz + N_XCD - 1) / N_XCD;
-  const int remainder = grid_sz % N_XCD;
-  const int offset = linear_bid / N_XCD;
-
-  const int subtract =
-      (remainder == 0 || bucket < remainder) ? 0 : (bucket - remainder);
-  return bucket * max_buckets + offset - subtract;
-}
-#undef N_XCD
-
-} // namespace details
 
 template <int kNumThreadsPerBlock = 512, bool useRadixSort = true,
           int Vector = 4>

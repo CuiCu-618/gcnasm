@@ -14,36 +14,51 @@ CXXFLAGS   += --offload-arch=$(GPU_ARCH)
 # 如果需要额外 include 目录，在这里加：
 INCLUDES   ?=
 
-# 源文件列表：
-# 如果你的 kernel 源文件是 .hip，可以改成：
-SRC        = main.hip
+# 两个源文件：baseline 和优化版
+SRC_BASE   = main.hip
+SRC_AIR    = main_air.hip
 
-OBJ        = $(SRC:.cpp=.o)
-# 对应 .hip 源文件的情况，也转成 .o
-OBJ        := $(OBJ:.hip=.o)
+OBJ_BASE   = $(SRC_BASE:.hip=.o)
+OBJ_AIR    = $(SRC_AIR:.hip=.o)
 
-TARGET     = test_topk_rocm
+TARGET_BASE = test_topk_rocm_base
+TARGET_AIR  = test_topk_rocm_air
 
-.PHONY: all clean run
+.PHONY: all clean run_base run_air profile_base profile_air
 
-all: $(TARGET)
+# 默认：两个都编译
+all: $(TARGET_BASE) $(TARGET_AIR)
 
-$(TARGET): $(OBJ)
+# 链接生成 baseline 程序
+$(TARGET_BASE): $(OBJ_BASE)
 	$(HIPCC) $(CXXFLAGS) $^ -o $@
 
-# 规则：编译 .cpp -> .o
-%.o: %.cpp
-	$(HIPCC) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+# 链接生成优化版程序
+$(TARGET_AIR): $(OBJ_AIR)
+	$(HIPCC) $(CXXFLAGS) $^ -o $@
 
-# 规则：编译 .hip -> .o（如果你有 .hip 源文件）
+# 规则：编译 .hip -> .o
 %.o: %.hip
 	$(HIPCC) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-run: $(TARGET)
-	./$(TARGET)
+# 运行 baseline
+run_base: $(TARGET_BASE)
+	./$(TARGET_BASE)
 
-profile: $(TARGET)
-	rocprof-compute profile -n $(TARGET) --no-roof -- ./$(TARGET)
+# 运行优化版
+run_air: $(TARGET_AIR)
+	./$(TARGET_AIR)
+
+# 默认 run 就跑 baseline，也可以改成 run_air
+run: run_base
+
+# profile baseline
+profile_base: $(TARGET_BASE)
+	rocprof-compute profile -n $(TARGET_BASE) --no-roof -- ./$(TARGET_BASE)
+
+# profile 优化版
+profile_air: $(TARGET_AIR)
+	rocprof-compute profile -n $(TARGET_AIR) --no-roof -- ./$(TARGET_AIR)
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ_BASE) $(OBJ_AIR) $(TARGET_BASE) $(TARGET_AIR)
