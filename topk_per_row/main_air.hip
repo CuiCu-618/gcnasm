@@ -31,26 +31,11 @@ using fp32x2 = __attribute__((__ext_vector_type__(2))) float;
 using fp32x4 = __attribute__((__ext_vector_type__(4))) float;
 using fp32x8 = __attribute__((__ext_vector_type__(8))) float;
 
+// AIR TopK start
+
 using WideT = fp32x4;
 constexpr int VECTORIZED_READ_SIZE = 16;
 constexpr int WARP_SIZE = 64;
-
-template <int vec> struct to_vector;
-
-template <> struct to_vector<1> {
-  using type = fp32x1;
-};
-
-template <> struct to_vector<2> {
-  using type = fp32x2;
-};
-
-template <> struct to_vector<4> {
-  using type = fp32x4;
-};
-template <> struct to_vector<8> {
-  using type = fp32x8;
-};
 
 template <typename IdxT> struct ComputeOffset {
   __host__ __device__ explicit ComputeOffset(IdxT const &cols) : cols_(cols) {}
@@ -95,10 +80,8 @@ __host__ __device__ int round(int num, int round_value) {
 template <typename T, int BitsPerPass>
 __device__ constexpr int calc_start_bit(int pass) {
   int start_bit = static_cast<int>(sizeof(T) * 8) - (pass + 1) * BitsPerPass;
-  if (start_bit < 0) {
-    start_bit = 0;
-  }
-  return start_bit;
+  int r = start_bit < 0 ? 0 : start_bit;
+  return r;
 }
 
 template <typename T, int BitsPerPass>
@@ -113,11 +96,17 @@ template <typename T>
 __device__ typename hipcub::Traits<T>::UnsignedBits
 twiddle_in(T key, bool select_min) {
   auto bits = reinterpret_cast<typename hipcub::Traits<T>::UnsignedBits &>(key);
-  bits = hipcub::Traits<T>::TwiddleIn(bits);
-  if (!select_min) {
-    bits = ~bits;
+  if constexpr (std::is_same_v<T, float>) {
+    // TODO: hardcoded for select_min is false!
+    uint32_t mask = (key < 0) ? 0 : 0x7fffffff;
+    return bits ^ mask;
+  } else {
+    bits = hipcub::Traits<T>::TwiddleIn(bits);
+    if (!select_min) {
+      bits = ~bits;
+    }
+    return bits;
   }
-  return bits;
 }
 
 template <typename T>
@@ -342,7 +331,7 @@ template <typename T, typename IdxT> struct alignas(128) Counter {
  * Fused filtering of the current pass and building histogram for the next pass
  * (see steps 4 & 1 in `radix_kernel` description).
  */
-template <typename T, typename IdxT, int BitsPerPass>
+template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES>
 __device__ void filter_and_histogram(T const *in_buf, IdxT const *in_idx_buf,
                                      T *out_buf, IdxT *out_idx_buf, T *out,
                                      IdxT *out_idx, IdxT previous_len,
@@ -389,7 +378,10 @@ __device__ void filter_and_histogram(T const *in_buf, IdxT const *in_idx_buf,
       if (previous_bits == kth_value_bits) {
         if (early_stop) {
           IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-          out[pos] = value;
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+
           out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
         } else {
           if (out_buf) {
@@ -412,7 +404,9 @@ __device__ void filter_and_histogram(T const *in_buf, IdxT const *in_idx_buf,
       // last chance.
       else if ((out_buf || early_stop) && previous_bits < kth_value_bits) {
         IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-        out[pos] = value;
+        if (WRITE_TOPK_VALUES) {
+          out[pos] = value;
+        }
         out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
       }
     };
@@ -427,9 +421,11 @@ __device__ void filter_and_histogram(T const *in_buf, IdxT const *in_idx_buf,
 
   // merge histograms produced by individual blocks
   for (int i = threadIdx.x; i < num_buckets; i += blockDim.x) {
-    if (histogram_smem[i] != 0) {
-      atomicAdd(histogram + i, histogram_smem[i]);
-    }
+    // if(histogram_smem[i] != 0)
+    // {
+    //     atomicAdd(histogram + i, histogram_smem[i]);
+    // }
+    *(histogram + i) = histogram_smem[i];
   }
 }
 
@@ -510,7 +506,7 @@ __device__ void choose_bucket(Counter<T, IdxT> *counter, IdxT const *histogram,
 
 // For one-block version, last_filter() could be called when pass < num_passes
 // - 1. So `pass` could not be constexpr
-template <typename T, typename IdxT, int BitsPerPass,
+template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false>
 __device__ void last_filter(T const *in_buf, IdxT const *in_idx_buf, T *out,
                             IdxT *out_idx, IdxT current_len, IdxT k,
@@ -524,37 +520,73 @@ __device__ void last_filter(T const *in_buf, IdxT const *in_idx_buf, T *out,
   IdxT *p_out_cnt = &counter->out_cnt;
   IdxT *p_out_back_cnt = &counter->out_back_cnt;
   IdxT *p_equal = out_idx + k - num_of_kth_needed;
-  for (IdxT i = threadIdx.x; i < current_len; i += blockDim.x) {
-    const T value = in_buf[i];
-    auto const bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
-    if (bits < kth_value_bits) {
-      IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-      out[pos] = value;
-      // For one-block version, `in_idx_buf` could be nullptr at pass 0.
-      // For non one-block version, if writing has been skipped, `in_idx_buf`
-      // could be nullptr if `in_buf` is `in`
-      out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
-    } else if (bits == kth_value_bits) {
-      IdxT new_idx = in_idx_buf ? in_idx_buf[i] : i;
-      IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
-      if (back_pos < num_of_kth_needed) {
-        IdxT pos = k - 1 - back_pos;
-        out[pos] = value;
-        if constexpr (!prioritize_smaller_indice) {
-          out_idx[pos] = new_idx;
+  if (in_idx_buf) {
+    for (IdxT i = threadIdx.x; i < current_len; i += blockDim.x) {
+      const T value = in_buf[i];
+      auto const bits = (twiddle_in(value, select_min) >> start_bit)
+                        << start_bit;
+      if (bits < kth_value_bits) {
+        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+        if (WRITE_TOPK_VALUES) {
+          out[pos] = value;
+        }
+        // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+        // For non one-block version, if writing has been skipped, `in_idx_buf`
+        // could be nullptr if `in_buf` is `in`
+        out_idx[pos] = in_idx_buf[i];
+      } else if (bits == kth_value_bits) {
+        IdxT new_idx = in_idx_buf[i];
+        IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+        if (back_pos < num_of_kth_needed) {
+          IdxT pos = k - 1 - back_pos;
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+          if constexpr (!prioritize_smaller_indice) {
+            out_idx[pos] = new_idx;
+          }
+        }
+      }
+    }
+  } else {
+    for (IdxT i = threadIdx.x; i < current_len; i += blockDim.x) {
+      const T value = in_buf[i];
+      auto const bits = (twiddle_in(value, select_min) >> start_bit)
+                        << start_bit;
+      if (bits < kth_value_bits) {
+        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+        if (WRITE_TOPK_VALUES) {
+          out[pos] = value;
+        }
+        // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+        // For non one-block version, if writing has been skipped, `in_idx_buf`
+        // could be nullptr if `in_buf` is `in`
+        out_idx[pos] = i;
+      } else if (bits == kth_value_bits) {
+        IdxT new_idx = i;
+        IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+        if (back_pos < num_of_kth_needed) {
+          IdxT pos = k - 1 - back_pos;
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+          if constexpr (!prioritize_smaller_indice) {
+            out_idx[pos] = new_idx;
+          }
         }
       }
     }
   }
 }
 
-template <typename T, typename IdxT, int BitsPerPass,
+template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false>
 __global__ void
 last_filter_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
                    IdxT const *in_idx_buf, T *out, IdxT *out_idx, IdxT len,
                    IdxT k, Counter<T, IdxT> *counters, bool const select_min) {
-  const size_t batch_id = blockIdx.y; // size_t to avoid multiplication overflow
+  const int64_t batch_id =
+      blockIdx.y; // size_t to avoid multiplication overflow
 
   Counter<T, IdxT> *counter = counters + batch_id;
   IdxT previous_len = counter->previous_len;
@@ -587,14 +619,18 @@ last_filter_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
     const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
     if (bits < kth_value_bits) {
       IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-      out[pos] = value;
+      if (WRITE_TOPK_VALUES) {
+        out[pos] = value;
+      }
       out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
     } else if (bits == kth_value_bits) {
       IdxT new_idx = in_idx_buf ? in_idx_buf[i] : i;
       IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
       if (back_pos < num_of_kth_needed) {
         IdxT pos = k - 1 - back_pos;
-        out[pos] = value;
+        if (WRITE_TOPK_VALUES) {
+          out[pos] = value;
+        }
         if constexpr (!prioritize_smaller_indice) {
           out_idx[pos] = new_idx;
         }
@@ -647,14 +683,15 @@ last_filter_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
  * and their indices.
  */
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
-          bool fused_last_filter, bool prioritize_smaller_indice = false>
+          bool fused_last_filter, bool WRITE_TOPK_VALUES,
+          bool prioritize_smaller_indice = false>
 __global__ void
 radix_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
              IdxT const *in_idx_buf, T *out_buf, IdxT *out_idx_buf, T *out,
              IdxT *out_idx, Counter<T, IdxT> *counters, IdxT *histograms,
              const IdxT len, const IdxT *rowStarts, const IdxT *rowEnds,
              const IdxT k, bool const select_min, int const pass) {
-  const size_t batch_id = blockIdx.y;
+  const int64_t batch_id = blockIdx.y;
   const IdxT row_len = rowEnds[batch_id] - rowStarts[batch_id];
 
   auto counter = counters + batch_id;
@@ -704,7 +741,7 @@ radix_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
   constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
   auto histogram = histograms + batch_id * num_buckets;
 
-  filter_and_histogram<T, IdxT, BitsPerPass>(
+  filter_and_histogram<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES>(
       in_buf, in_idx_buf, out_buf, out_idx_buf, out, out_idx, previous_len,
       counter, histogram, select_min, pass, early_stop);
   __threadfence();
@@ -733,11 +770,13 @@ radix_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
 
     constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
     // reset for next pass
-    if (pass != num_passes - 1) {
-      for (int i = threadIdx.x; i < num_buckets; i += blockDim.x) {
-        histogram[i] = 0;
-      }
-    }
+    // if(pass != num_passes - 1)
+    // {
+    //     for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
+    //     {
+    //         histogram[i] = 0;
+    //     }
+    // }
     if (threadIdx.x == 0) {
       // `last_filter_kernel()` requires setting previous_len even in the last
       // pass
@@ -753,7 +792,8 @@ radix_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
       }
       __syncthreads();
       if constexpr (fused_last_filter) {
-        last_filter<T, IdxT, BitsPerPass, prioritize_smaller_indice>(
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES,
+                    prioritize_smaller_indice>(
             out_buf ? out_buf : in_buf, out_idx_buf ? out_idx_buf : in_idx_buf,
             out, out_idx, out_buf ? current_len : row_len, k, counter,
             select_min, pass);
@@ -762,15 +802,17 @@ radix_kernel(T const *in, IdxT const *in_idx, T const *in_buf,
   }
 }
 
-template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
+          bool WRITE_TOPK_VALUES>
 unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt) {
   static_assert(VECTORIZED_READ_SIZE / sizeof(T) >= 1);
 
   int active_blocks;
   HIP_CHECK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
       &active_blocks,
-      radix_kernel<T, IdxT, BitsPerPass, BlockSize, false, false>, BlockSize,
-      0));
+      radix_kernel<T, IdxT, BitsPerPass, BlockSize, false, WRITE_TOPK_VALUES,
+                   false>,
+      BlockSize, 0));
   active_blocks *= sm_cnt;
 
   IdxT best_num_blocks = 0;
@@ -866,7 +908,7 @@ __device__ void set_buf_pointers(T const *in, IdxT const *in_idx, char *bufs,
 
 // The following a few functions are for the one-block version, which uses
 // single thread block for each row of a batch.
-template <typename T, typename IdxT, int BitsPerPass>
+template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES>
 __device__ void filter_and_histogram_for_one_block(
     T const *in_buf, IdxT const *in_idx_buf, T *out_buf, IdxT *out_idx_buf,
     T *out, IdxT *out_idx, const IdxT previous_len, Counter<T, IdxT> *counter,
@@ -913,33 +955,60 @@ __device__ void filter_and_histogram_for_one_block(
     auto const kth_value_bits = counter->kth_value_bits;
     int const previous_start_bit = calc_start_bit<T, BitsPerPass>(pass - 1);
 
-    for (IdxT i = threadIdx.x; i < previous_len; i += blockDim.x) {
-      const T value = in_buf[i];
-      auto const previous_bits =
-          (twiddle_in(value, select_min) >> previous_start_bit)
-          << previous_start_bit;
-      if (previous_bits == kth_value_bits) {
+    if (in_idx_buf) {
+      for (IdxT i = threadIdx.x; i < previous_len; i += blockDim.x) {
+        const T value = in_buf[i];
+        auto const previous_bits =
+            (twiddle_in(value, select_min) >> previous_start_bit)
+            << previous_start_bit;
+        if (previous_bits == kth_value_bits) {
 
-        IdxT pos = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
-        out_buf[pos] = value;
-        out_idx_buf[pos] = in_idx_buf ? in_idx_buf[i] : i;
+          IdxT pos = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+          out_buf[pos] = value;
+          out_idx_buf[pos] = in_idx_buf[i];
 
-        int bucket =
-            calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
-        atomicAdd(histogram + bucket, static_cast<IdxT>(1));
-      } else if (previous_bits < kth_value_bits) {
-        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
-        out[pos] = value;
-        out_idx[pos] = in_idx_buf ? in_idx_buf[i] : i;
+          int bucket =
+              calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
+          atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        } else if (previous_bits < kth_value_bits) {
+          IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+          out_idx[pos] = in_idx_buf[i];
+        }
+      }
+    } else {
+      for (IdxT i = threadIdx.x; i < previous_len; i += blockDim.x) {
+        const T value = in_buf[i];
+        auto const previous_bits =
+            (twiddle_in(value, select_min) >> previous_start_bit)
+            << previous_start_bit;
+        if (previous_bits == kth_value_bits) {
+
+          IdxT pos = atomicAdd(p_filter_cnt, static_cast<IdxT>(1));
+          out_buf[pos] = value;
+          out_idx_buf[pos] = i;
+
+          int bucket =
+              calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
+          atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+        } else if (previous_bits < kth_value_bits) {
+          IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+          out_idx[pos] = i;
+        }
       }
     }
   }
 }
 
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
-          bool prioritize_smaller_indice = false>
+          bool WRITE_TOPK_VALUES, bool prioritize_smaller_indice = false>
 __global__ void
-radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const IdxT len,
+radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
                             const IdxT *rowStarts, const IdxT *rowEnds,
                             const IdxT k, T *out, IdxT *out_idx,
                             bool const select_min, char *bufs) {
@@ -947,8 +1016,10 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const IdxT len,
   __shared__ Counter<T, IdxT> counter;
   __shared__ IdxT histogram[num_buckets];
 
-  const size_t batch_id = blockIdx.x;
-  const IdxT row_len = rowEnds[batch_id] - rowStarts[batch_id];
+  const int64_t batch_id = blockIdx.x;
+  const IdxT rowStart = rowStarts[batch_id];
+  const IdxT rowEnd = rowEnds[batch_id];
+  const IdxT row_len = rowEnd - rowStart;
   if (threadIdx.x == 0) {
     counter.k = k;
     counter.len = row_len;
@@ -966,6 +1037,17 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const IdxT len,
 
   out += batch_id * k;
   out_idx += batch_id * k;
+  if (row_len <= k) {
+    in += rowStart;
+    for (int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize) {
+      out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
+      if (WRITE_TOPK_VALUES) {
+        out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
+      }
+    }
+    return;
+  }
+
   const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(row_len);
   bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
@@ -992,7 +1074,7 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const IdxT len,
       out_idx_buf = nullptr;
     }
 
-    filter_and_histogram_for_one_block<T, IdxT, BitsPerPass>(
+    filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES>(
         in_buf, in_idx_buf, out_buf, out_idx_buf, out, out_idx, previous_len,
         &counter, histogram, select_min,
         pass); //@TODO CHECK UPDATE CODE
@@ -1008,12 +1090,13 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const IdxT len,
     __syncthreads();
 
     if (pass == num_passes - 1) {
-      last_filter<T, IdxT, BitsPerPass, prioritize_smaller_indice>(
+      last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES,
+                  prioritize_smaller_indice>(
           out_buf ? out_buf : in, out_buf ? out_idx_buf : in_idx, out, out_idx,
           out_buf ? current_len : row_len, k, &counter, select_min, pass);
       break;
     } else if (counter.len == counter.k) {
-      last_filter<T, IdxT, BitsPerPass, false>(
+      last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
           out_buf ? out_buf : in, out_buf ? out_idx_buf : in_idx, out, out_idx,
           out_buf ? current_len : row_len, k, &counter, select_min, pass);
       break;
@@ -1049,12 +1132,14 @@ calc_aligned_pointers(void const *p, std::vector<size_t> const &sizes) {
   return aligned_pointers;
 }
 
-template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
+          bool WRITE_TOPK_VALUES>
 void standalone_stable_radix_topk_(void *buf, size_t &buf_size, T const *in,
-                                   IdxT const *in_idx, int batch_size, IdxT len,
-                                   IdxT *rowStarts, IdxT *rowEnds, IdxT k,
-                                   T *out, IdxT *out_idx, bool select_min,
-                                   bool fused_last_filter, unsigned grid_dim,
+                                   IdxT const *in_idx, int batch_size,
+                                   int64_t len, IdxT *rowStarts, IdxT *rowEnds,
+                                   IdxT k, T *out, IdxT *out_idx,
+                                   bool select_min, bool fused_last_filter,
+                                   unsigned grid_dim, hipStream_t stream,
                                    bool sorted = false) {
   static_assert(calc_num_passes<T, BitsPerPass>() > 1);
   constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
@@ -1095,8 +1180,9 @@ void standalone_stable_radix_topk_(void *buf, size_t &buf_size, T const *in,
     topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[6]);
 
     HIP_CHECK(hipMemsetAsync(aligned_pointers[0], 0,
-                             static_cast<char *>(aligned_pointers[2]) -
-                                 static_cast<char *>(aligned_pointers[0])));
+                            static_cast<char *>(aligned_pointers[2]) -
+                                static_cast<char *>(aligned_pointers[0]),
+                            stream));
   }
 
   T const *in_buf = nullptr;
@@ -1108,33 +1194,37 @@ void standalone_stable_radix_topk_(void *buf, size_t &buf_size, T const *in,
 
   constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
 
-  auto kernel = radix_kernel<T, IdxT, BitsPerPass, BlockSize, false, false>;
+  auto kernel = radix_kernel<T, IdxT, BitsPerPass, BlockSize, false,
+                             WRITE_TOPK_VALUES, false>;
 
   for (int pass = 0; pass < num_passes; ++pass) {
     set_buf_pointers(in, in_idx, buf1, idx_buf1, buf2, idx_buf2, pass, in_buf,
                      in_idx_buf, out_buf, out_idx_buf);
 
     if (fused_last_filter && pass == num_passes - 1) {
-      kernel = radix_kernel<T, IdxT, BitsPerPass, BlockSize, true, false>;
+      kernel = radix_kernel<T, IdxT, BitsPerPass, BlockSize, true,
+                            WRITE_TOPK_VALUES, false>;
     }
 
-    kernel<<<blocks, BlockSize, 0>>>(
+    kernel<<<blocks, BlockSize, 0, stream>>>(
         in, in_idx, in_buf, in_idx_buf, out_buf, out_idx_buf, out, out_idx,
         counters, histograms, len, rowStarts, rowEnds, k, select_min, pass);
   }
 
   if (!fused_last_filter) {
-    last_filter_kernel<T, IdxT, BitsPerPass, true>
-        <<<blocks, BlockSize, 0>>>(in, in_idx, out_buf, out_idx_buf, out,
-                                   out_idx, len, k, counters, select_min);
+    last_filter_kernel<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, true>
+        <<<blocks, BlockSize, 0, stream>>>(in, in_idx, out_buf, out_idx_buf,
+                                           out, out_idx, len, k, counters,
+                                           select_min);
   }
 }
 
-template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
+          bool WRITE_TOPK_VALUES>
 void standalone_stable_radix_topk_one_block_(
     void *buf, size_t &buf_size, T const *in, IdxT const *in_idx,
-    int batch_size, IdxT len, IdxT *rowStarts, IdxT *rowEnds, IdxT k, T *out,
-    IdxT *out_idx, bool select_min, bool sorted = false) {
+    int batch_size, int64_t len, IdxT *rowStarts, IdxT *rowEnds, IdxT k, T *out,
+    IdxT *out_idx, bool select_min, hipStream_t stream, bool sorted = false) {
   static_assert(calc_num_passes<T, BitsPerPass>() > 1);
 
   char *bufs = nullptr;
@@ -1160,23 +1250,28 @@ void standalone_stable_radix_topk_one_block_(
     topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[1]);
   }
 
-  radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, false>
-      <<<batch_size, BlockSize, 0>>>(in, in_idx, len, rowStarts, rowEnds, k,
-                                     out, out_idx, select_min, bufs);
+  radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize,
+                              WRITE_TOPK_VALUES, false>
+      <<<batch_size, BlockSize, 0, stream>>>(in, in_idx, len, rowStarts,
+                                             rowEnds, k, out, out_idx,
+                                             select_min, bufs);
 }
 
-template <typename T, typename IdxT, bool sorted = false>
+template <typename T, typename IdxT, bool WRITE_TOPK_VALUES,
+          bool sorted = false>
 void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
-                                    int batch_size, IdxT len, IdxT *rowStarts,
-                                    IdxT *rowEnds, IdxT k, T *out,
-                                    IdxT *out_idx, bool greater) {
+                                    int batch_size, int64_t len,
+                                    IdxT *rowStarts, IdxT *rowEnds, IdxT k,
+                                    T *out, IdxT *out_idx, bool greater,
+                                    hipStream_t stream) {
   constexpr int items_per_thread = 32;
-  constexpr int block_dim = 512;
+  constexpr int block_dim = 1024;
   constexpr bool fused_last_filter = false;
   if (len <= block_dim * items_per_thread) {
-    standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim>(
+    standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
+                                            WRITE_TOPK_VALUES>(
         buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
-        rowStarts, rowEnds, k, out, out_idx, !greater, sorted);
+        rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
   } else {
     auto get_num_cu_local = []() {
       hipDevice_t dev;
@@ -1189,17 +1284,19 @@ void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
     int sm_cnt = get_num_cu_local();
 
     unsigned grid_dim =
-        calc_grid_dim<T, IdxT, 11, block_dim>(batch_size, len, sm_cnt);
+        calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(batch_size,
+                                                                 len, sm_cnt);
 
     if (grid_dim == 1) {
-      standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim>(
+      standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
+                                              WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
-          rowStarts, rowEnds, k, out, out_idx, !greater, sorted);
+          rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
     } else {
-      standalone_stable_radix_topk_<T, IdxT, 11, block_dim>(
+      standalone_stable_radix_topk_<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
           rowStarts, rowEnds, k, out, out_idx, !greater, fused_last_filter,
-          grid_dim, sorted);
+          grid_dim, stream, sorted);
     }
   }
 }
@@ -1231,13 +1328,13 @@ size_t invokeComputeTopkLastDimWorkspaceSize(int32_t batchSize,
   };
 
   int sm_cnt = get_num_cu_local();
-  unsigned grid_dim = aiter::calc_grid_dim<T, IdxT, 11, block_dim>(
+  unsigned grid_dim = aiter::calc_grid_dim<T, IdxT, 11, block_dim, false>(
       batchSize, inputLength, sm_cnt);
 
-  aiter::standalone_stable_radix_topk_<T, IdxT, 11, block_dim>(
+  aiter::standalone_stable_radix_topk_<T, IdxT, 11, block_dim, true>(
       workspace, buf_size, in, static_cast<IdxT *>(nullptr), batchSize,
       inputLength, static_cast<IdxT *>(nullptr), static_cast<IdxT *>(nullptr),
-      k, out_val, out_idx, !is_largest, fused_last_filter, grid_dim, sorted);
+      k, out_val, out_idx, !is_largest, fused_last_filter, grid_dim, 0, sorted);
   return buf_size;
 }
 
@@ -1252,9 +1349,9 @@ void invokeTopkLastDim(int32_t batchSize, int32_t inputLength,
   T *out_val_ = reinterpret_cast<T *>(out_val);
   int32_t *out_idx_ = reinterpret_cast<int32_t *>(out_idx);
 
-  aiter::standalone_stable_radix_11bits<T, int32_t, true>(
+  aiter::standalone_stable_radix_11bits<T, int32_t, true, true>(
       workspace, buf_size, in, batchSize, inputLength, rowStarts, rowEnds, k,
-      out_val_, out_idx_, is_largest);
+      out_val_, out_idx_, is_largest, 0);
 }
 
 // ============= 工具函数 =============
@@ -1391,6 +1488,7 @@ int main(int argc, char **argv) {
   int32_t top_k = 2048;
   bool cpu_check = true;
   int seed = 42;
+  DataGeneration data_generation = DataGeneration::Random;
 
   if (argc > 1) {
     num_prefix = std::stoi(argv[1]);
@@ -1404,6 +1502,17 @@ int main(int argc, char **argv) {
   if (argc > 4) {
     cpu_check = (std::stoi(argv[4]) != 0);
   }
+  if (argc > 5) {
+    int mode = std::stoi(argv[5]);
+    if (mode == 0) {
+      data_generation = DataGeneration::Random;
+    } else if (mode == 1) {
+      data_generation = DataGeneration::TenLSBits;
+    } else {
+      std::cerr << "Invalid data generation mode: " << mode << std::endl;
+      return -1;
+    }
+  }
 
   // 1. host 上创建 row_starts / row_ends
   std::vector<int32_t> h_row_starts;
@@ -1416,7 +1525,7 @@ int main(int argc, char **argv) {
   int32_t stride1 = 0;
 
   // 随机模式，等价于 data_generation="random"
-  create_random_logits(h_row_starts, h_row_ends, seed, DataGeneration::Random,
+  create_random_logits(h_row_starts, h_row_ends, seed, data_generation,
                        h_logits, stride0, stride1);
 
   const int32_t max_end = stride0; // 就是列数
