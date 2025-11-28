@@ -10,6 +10,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -1052,6 +1053,7 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
   bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
   constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
+  // constexpr int num_passes = 1;  
   for (int pass = 0; pass < num_passes; ++pass) {
     T const *in_buf = nullptr;
     IdxT const *in_idx_buf = nullptr;
@@ -1180,9 +1182,9 @@ void standalone_stable_radix_topk_(void *buf, size_t &buf_size, T const *in,
     topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[6]);
 
     HIP_CHECK(hipMemsetAsync(aligned_pointers[0], 0,
-                            static_cast<char *>(aligned_pointers[2]) -
-                                static_cast<char *>(aligned_pointers[0]),
-                            stream));
+                             static_cast<char *>(aligned_pointers[2]) -
+                                 static_cast<char *>(aligned_pointers[0]),
+                             stream));
   }
 
   T const *in_buf = nullptr;
@@ -1479,6 +1481,131 @@ void cpu_topk_per_row_prefill(
   }
 }
 
+inline bool allclose_vec(
+    const std::vector<float>& a,
+    const std::vector<float>& b,
+    float rtol,
+    float atol
+) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        float va = a[i];
+        float vb = b[i];
+        float diff = std::fabs(va - vb);
+        float max_ab = std::max(std::fabs(va), std::fabs(vb));
+        if (diff > atol + rtol * max_ab) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// logits:  一维数组, 大小 = num_rows * vocab_size
+// cuda_indices / torch_indices: 一维数组, 大小 = num_rows * top_k
+// row_starts / row_ends: 长度 = num_rows
+bool compare_topk_results_flat(
+    const float* logits,
+    const int32_t* cuda_indices,
+    const int32_t* torch_indices,
+    const int32_t* row_starts,
+    const int32_t* row_ends,
+    int32_t num_rows,
+    int32_t vocab_size,
+    int32_t top_k,
+    float tolerance = 1e-5f
+) {
+    assert(num_rows >= 0);
+    assert(vocab_size > 0);
+    assert(top_k > 0);
+
+    for (int32_t row_idx = 0; row_idx < num_rows; ++row_idx) {
+        int32_t row_start  = row_starts[row_idx];
+        int32_t row_end    = row_ends[row_idx];
+        int32_t row_length = row_end - row_start;
+
+        // 防御性检查：避免负数转成超大 size_t
+        if (row_length < 0) {
+            std::cerr << "Row " << row_idx
+                      << " has negative length: row_end=" << row_end
+                      << ", row_start=" << row_start << std::endl;
+            return false;
+        }
+
+        int32_t num_valid = std::min(top_k, row_length);
+        if (num_valid <= 0) {
+            // 没有有效元素可以比，直接跳过
+            continue;
+        }
+
+        const int32_t* cuda_row  = cuda_indices  + row_idx * top_k;
+        const int32_t* torch_row = torch_indices + row_idx * top_k;
+
+        // 构建当前行的 index 集合
+        std::unordered_set<int32_t> cuda_set;
+        std::unordered_set<int32_t> torch_set;
+        cuda_set.reserve(num_valid);
+        torch_set.reserve(num_valid);
+
+        for (int32_t i = 0; i < num_valid; ++i) {
+            cuda_set.insert(cuda_row[i]);
+            torch_set.insert(torch_row[i]);
+        }
+
+        // index 集合完全一致，继续下一行
+        if (cuda_set == torch_set) {
+            continue;
+        }
+
+        // 有差异：取这些差异 index 对应的 logits
+        const float* logits_row = logits + row_idx * vocab_size;
+        std::vector<float> cuda_only_values;
+        std::vector<float> torch_only_values;
+        cuda_only_values.reserve(top_k);
+        torch_only_values.reserve(top_k);
+
+        // cuda_set - torch_set
+        for (int32_t idx : cuda_set) {
+            if (torch_set.find(idx) == torch_set.end()) {
+                // 防御性检查，避免 idx 越界
+                if (idx < 0 || idx >= vocab_size) {
+                    std::cerr << "Invalid index " << idx
+                              << " in cuda_set at row " << row_idx << std::endl;
+                    return false;
+                }
+                cuda_only_values.push_back(logits_row[idx]);
+            }
+        }
+
+        // torch_set - cuda_set
+        for (int32_t idx : torch_set) {
+            if (cuda_set.find(idx) == cuda_set.end()) {
+                if (idx < 0 || idx >= vocab_size) {
+                    std::cerr << "Invalid index " << idx
+                              << " in torch_set at row " << row_idx << std::endl;
+                    return false;
+                }
+                torch_only_values.push_back(logits_row[idx]);
+            }
+        }
+
+        if (cuda_only_values.size() != torch_only_values.size()) {
+            return false;
+        }
+
+        // 与 Python 版保持语义一致：比较“集合的值”，而不是顺序
+        std::sort(cuda_only_values.begin(), cuda_only_values.end());
+        std::sort(torch_only_values.begin(), torch_only_values.end());
+
+        if (!allclose_vec(cuda_only_values, torch_only_values,
+                          /*rtol=*/tolerance,
+                          /*atol=*/tolerance)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ============= main: 造数据+调 kernel =============
 
 int main(int argc, char **argv) {
@@ -1602,9 +1729,12 @@ int main(int argc, char **argv) {
 
   // 6. 如果你想检查输出，可以拷回 host 看一下
   std::vector<int32_t> h_indices(static_cast<size_t>(num_rows) * top_k);
+  std::vector<float> h_values(static_cast<size_t>(num_rows) * top_k);
   HIP_CHECK(hipMemcpy(h_indices.data(), d_indices,
                       h_indices.size() * sizeof(int32_t),
                       hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(h_values.data(), d_values,
+                      h_values.size() * sizeof(float), hipMemcpyDeviceToHost));
 
   // TODO: 打印部分结果做 sanity check（可选）
   std::cout << "indices[0, 0:10]: ";
@@ -1631,27 +1761,11 @@ int main(int argc, char **argv) {
   cpu_topk_per_row_prefill(num_rows, h_row_starts, h_row_ends, top_k, h_logits,
                            h_indices_ref, h_values_ref);
   // 检查前几行结果, 不假设顺序一致，只检查是否包含相同元素
-  bool all_ok = true;
-  for (int32_t i = 0; i < std::min(5, num_rows); ++i) {
-    std::vector<int32_t> cpu_indices_row(h_indices_ref.begin() + i * top_k,
-                                         h_indices_ref.begin() +
-                                             (i + 1) * top_k);
-    std::vector<int32_t> gpu_indices_row(h_indices.begin() + i * top_k,
-                                         h_indices.begin() + (i + 1) * top_k);
-    std::sort(cpu_indices_row.begin(), cpu_indices_row.end());
-    std::sort(gpu_indices_row.begin(), gpu_indices_row.end());
-    if (cpu_indices_row != gpu_indices_row) {
-      all_ok = false;
-      std::cout << "Mismatch in row " << i << "!" << std::endl;
-      // output mismatched cols
-      for (int32_t j = 0; j < top_k; ++j) {
-        if (cpu_indices_row[j] != gpu_indices_row[j]) {
-          std::cout << "  CPU index: " << cpu_indices_row[j]
-                    << ", GPU index: " << gpu_indices_row[j] << std::endl;
-        }
-      }
-    }
-  }
+
+  bool all_ok = compare_topk_results_flat(
+      h_logits.data(), h_indices.data(), h_indices_ref.data(),
+      h_row_starts.data(), h_row_ends.data(), num_rows, max_end, top_k,
+      /*tolerance=*/1e-5f);
 
   if (all_ok) {
     std::cout << "All checked results match!" << std::endl;
