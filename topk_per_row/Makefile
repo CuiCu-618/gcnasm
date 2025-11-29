@@ -9,7 +9,7 @@ GPU_ARCH   ?= gfx942
 
 # 通用编译选项
 CXXFLAGS   ?= -O3 -std=c++17
-CXXFLAGS   += --offload-arch=$(GPU_ARCH)
+CXXFLAGS   += --offload-arch=$(GPU_ARCH) -Rpass-analysis=kernel-resource-usage
 
 # 如果需要额外 include 目录，在这里加：
 INCLUDES   ?=

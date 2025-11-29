@@ -1,6 +1,4 @@
-// test_topk_rocm.cpp
-#include <hip/hip_runtime.h>
-
+#include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -9,8 +7,8 @@
 #include <limits>
 #include <random>
 #include <string>
-#include <vector>
 #include <unordered_set>
+#include <vector>
 
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -1053,7 +1051,6 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
   bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
   constexpr int num_passes = calc_num_passes<T, BitsPerPass>();
-  // constexpr int num_passes = 1;  
   for (int pass = 0; pass < num_passes; ++pass) {
     T const *in_buf = nullptr;
     IdxT const *in_idx_buf = nullptr;
@@ -1102,6 +1099,151 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
           out_buf ? out_buf : in, out_buf ? out_idx_buf : in_idx, out, out_idx,
           out_buf ? current_len : row_len, k, &counter, select_min, pass);
       break;
+    }
+  }
+}
+
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
+          bool WRITE_TOPK_VALUES, bool prioritize_smaller_indice = false>
+__global__ void radix_topk_one_block_one_pass_kernel(
+    T const *in, IdxT const *in_idx, const int64_t len, const IdxT *rowStarts,
+    const IdxT *rowEnds, const IdxT k, T *out, IdxT *out_idx,
+    bool const select_min, char *bufs) {
+  constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+  __shared__ Counter<T, IdxT> counter;
+  __shared__ IdxT histogram[num_buckets];
+
+  const int64_t batch_id = blockIdx.x;
+  const IdxT rowStart = rowStarts[batch_id];
+  const IdxT rowEnd = rowEnds[batch_id];
+  const IdxT row_len = rowEnd - rowStart;
+  if (threadIdx.x == 0) {
+    counter.k = k;
+    counter.len = row_len;
+    counter.previous_len = row_len;
+    counter.kth_value_bits = 0;
+    counter.out_cnt = 0;
+    counter.out_back_cnt = 0;
+  }
+  __syncthreads();
+
+  in += batch_id * len;
+  if (in_idx) {
+    in_idx += batch_id * len;
+  }
+
+  out += batch_id * k;
+  out_idx += batch_id * k;
+  if (row_len <= k) {
+    in += rowStart;
+    for (int rowIt = threadIdx.x; rowIt < k; rowIt += BlockSize) {
+      out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
+      if (WRITE_TOPK_VALUES) {
+        out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
+      }
+    }
+    return;
+  }
+
+  constexpr int num_passes = 1;
+  for (int pass = 0; pass < num_passes; ++pass) {
+
+    const IdxT current_len = counter.len;
+    const IdxT current_k = counter.k;
+    IdxT previous_len = counter.previous_len;
+
+    for (int i = threadIdx.x; i < num_buckets; i += blockDim.x) {
+      histogram[i] = 0;
+    }
+    IdxT *p_filter_cnt = &counter.filter_cnt;
+    if (threadIdx.x == 0) {
+      *p_filter_cnt = 0;
+    }
+    __syncthreads();
+
+    // histogram calculation
+    unsigned const mask = (1 << BitsPerPass) - 1;
+    auto f = [select_min, mask](T value, IdxT) {
+      int bucket = calc_bucket<T, BitsPerPass>(value, 0, mask, select_min);
+      atomicAdd(histogram + bucket, static_cast<IdxT>(1));
+    };
+    vectorized_process(threadIdx.x, blockDim.x, in, previous_len, f);
+    __syncthreads();
+
+    scan<IdxT, BitsPerPass, BlockSize>(histogram);
+    __syncthreads();
+
+    // choose bucket
+    for (int i = threadIdx.x; i < num_buckets; i += blockDim.x) {
+      IdxT prev = (i == 0) ? 0 : histogram[i - 1];
+      IdxT cur = histogram[i];
+
+      // one and only one thread will satisfy this condition, so counter is
+      // written by only one thread
+      if (prev < k && cur >= k) {
+        counter.k = k - prev;     // how many values still are there to find
+        counter.len = cur - prev; // number of values in next pass
+        typename hipcub::Traits<T>::UnsignedBits bucket = i;
+        counter.kth_value_bits = bucket;
+      }
+    }
+
+    if (threadIdx.x == 0) {
+      counter.previous_len = current_len;
+    }
+    __syncthreads();
+
+    auto const kth_value_bits = counter.kth_value_bits;
+#if 0
+    //debug print
+    if(threadIdx.x==0 && batch_id==0){
+        printf("kth_value_bits: %u\n", kth_value_bits);
+        printf("mask: %u\n", mask);
+        
+        // in
+        for(int i=0; i<10; i++){
+            printf("in[%d]: %f ", i, static_cast<float>(in[i]));
+        }
+        printf("\n");
+    }
+#endif
+
+    // last filtering
+    const IdxT num_of_kth_needed = counter.k;
+    IdxT *p_out_cnt = &counter.out_cnt;
+    IdxT *p_out_back_cnt = &counter.out_back_cnt;
+
+    for (IdxT i = threadIdx.x; i < current_len; i += blockDim.x) {
+      const T value = in[i];
+      auto const bits = twiddle_in(value, select_min) & mask;
+#if 0
+        //debug print
+        if(threadIdx.x ==0 && batch_id==0 && i<10){
+            printf("value[%u]: %f, bits: %u\n", i, static_cast<float>(value), bits);
+        }
+#endif
+      if (bits < kth_value_bits) {
+        IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+        if (WRITE_TOPK_VALUES) {
+          out[pos] = value;
+        }
+        // For one-block version, `in_idx_buf` could be nullptr at pass 0.
+        // For non one-block version, if writing has been skipped, `in_idx_buf`
+        // could be nullptr if `in_buf` is `in`
+        out_idx[pos] = i;
+      } else if (bits == kth_value_bits) {
+        IdxT new_idx = i;
+        IdxT back_pos = atomicAdd(p_out_back_cnt, static_cast<IdxT>(1));
+        if (back_pos < num_of_kth_needed) {
+          IdxT pos = k - 1 - back_pos;
+          if (WRITE_TOPK_VALUES) {
+            out[pos] = value;
+          }
+          if constexpr (!prioritize_smaller_indice) {
+            out_idx[pos] = new_idx;
+          }
+        }
+      }
     }
   }
 }
@@ -1252,8 +1394,8 @@ void standalone_stable_radix_topk_one_block_(
     topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[1]);
   }
 
-  radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize,
-                              WRITE_TOPK_VALUES, false>
+  radix_topk_one_block_one_pass_kernel<T, IdxT, BitsPerPass, BlockSize,
+                                       WRITE_TOPK_VALUES, false>
       <<<batch_size, BlockSize, 0, stream>>>(in, in_idx, len, rowStarts,
                                              rowEnds, k, out, out_idx,
                                              select_min, bufs);
@@ -1269,8 +1411,9 @@ void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
   constexpr int items_per_thread = 32;
   constexpr int block_dim = 1024;
   constexpr bool fused_last_filter = false;
+
   if (len <= block_dim * items_per_thread) {
-    standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
+    standalone_stable_radix_topk_one_block_<T, IdxT, 10, block_dim,
                                             WRITE_TOPK_VALUES>(
         buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
         rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
@@ -1286,14 +1429,16 @@ void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
     int sm_cnt = get_num_cu_local();
 
     unsigned grid_dim =
-        calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(batch_size,
+        calc_grid_dim<T, IdxT, 10, block_dim, WRITE_TOPK_VALUES>(batch_size,
                                                                  len, sm_cnt);
 
     if (grid_dim == 1) {
-      standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
+      standalone_stable_radix_topk_one_block_<T, IdxT, 10, block_dim,
                                               WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
           rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
+
+        // std::cout << "Warning: using one-block topk even len > block_dim * items_per_thread" << std::endl;
     } else {
       standalone_stable_radix_topk_<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
@@ -1481,129 +1626,121 @@ void cpu_topk_per_row_prefill(
   }
 }
 
-inline bool allclose_vec(
-    const std::vector<float>& a,
-    const std::vector<float>& b,
-    float rtol,
-    float atol
-) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        float va = a[i];
-        float vb = b[i];
-        float diff = std::fabs(va - vb);
-        float max_ab = std::max(std::fabs(va), std::fabs(vb));
-        if (diff > atol + rtol * max_ab) {
-            return false;
-        }
+inline bool allclose_vec(const std::vector<float> &a,
+                         const std::vector<float> &b, float rtol, float atol) {
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    float va = a[i];
+    float vb = b[i];
+    float diff = std::fabs(va - vb);
+    float max_ab = std::max(std::fabs(va), std::fabs(vb));
+    if (diff > atol + rtol * max_ab) {
+      return false;
     }
-    return true;
+  }
+  return true;
 }
 
 // logits:  一维数组, 大小 = num_rows * vocab_size
 // cuda_indices / torch_indices: 一维数组, 大小 = num_rows * top_k
 // row_starts / row_ends: 长度 = num_rows
-bool compare_topk_results_flat(
-    const float* logits,
-    const int32_t* cuda_indices,
-    const int32_t* torch_indices,
-    const int32_t* row_starts,
-    const int32_t* row_ends,
-    int32_t num_rows,
-    int32_t vocab_size,
-    int32_t top_k,
-    float tolerance = 1e-5f
-) {
-    assert(num_rows >= 0);
-    assert(vocab_size > 0);
-    assert(top_k > 0);
+bool compare_topk_results_flat(const float *logits, const int32_t *cuda_indices,
+                               const int32_t *torch_indices,
+                               const int32_t *row_starts,
+                               const int32_t *row_ends, int32_t num_rows,
+                               int32_t vocab_size, int32_t top_k,
+                               float tolerance = 1e-5f) {
+  assert(num_rows >= 0);
+  assert(vocab_size > 0);
+  assert(top_k > 0);
 
-    for (int32_t row_idx = 0; row_idx < num_rows; ++row_idx) {
-        int32_t row_start  = row_starts[row_idx];
-        int32_t row_end    = row_ends[row_idx];
-        int32_t row_length = row_end - row_start;
+  for (int32_t row_idx = 0; row_idx < num_rows; ++row_idx) {
+    int32_t row_start = row_starts[row_idx];
+    int32_t row_end = row_ends[row_idx];
+    int32_t row_length = row_end - row_start;
 
-        // 防御性检查：避免负数转成超大 size_t
-        if (row_length < 0) {
-            std::cerr << "Row " << row_idx
-                      << " has negative length: row_end=" << row_end
-                      << ", row_start=" << row_start << std::endl;
-            return false;
-        }
-
-        int32_t num_valid = std::min(top_k, row_length);
-        if (num_valid <= 0) {
-            // 没有有效元素可以比，直接跳过
-            continue;
-        }
-
-        const int32_t* cuda_row  = cuda_indices  + row_idx * top_k;
-        const int32_t* torch_row = torch_indices + row_idx * top_k;
-
-        // 构建当前行的 index 集合
-        std::unordered_set<int32_t> cuda_set;
-        std::unordered_set<int32_t> torch_set;
-        cuda_set.reserve(num_valid);
-        torch_set.reserve(num_valid);
-
-        for (int32_t i = 0; i < num_valid; ++i) {
-            cuda_set.insert(cuda_row[i]);
-            torch_set.insert(torch_row[i]);
-        }
-
-        // index 集合完全一致，继续下一行
-        if (cuda_set == torch_set) {
-            continue;
-        }
-
-        // 有差异：取这些差异 index 对应的 logits
-        const float* logits_row = logits + row_idx * vocab_size;
-        std::vector<float> cuda_only_values;
-        std::vector<float> torch_only_values;
-        cuda_only_values.reserve(top_k);
-        torch_only_values.reserve(top_k);
-
-        // cuda_set - torch_set
-        for (int32_t idx : cuda_set) {
-            if (torch_set.find(idx) == torch_set.end()) {
-                // 防御性检查，避免 idx 越界
-                if (idx < 0 || idx >= vocab_size) {
-                    std::cerr << "Invalid index " << idx
-                              << " in cuda_set at row " << row_idx << std::endl;
-                    return false;
-                }
-                cuda_only_values.push_back(logits_row[idx]);
-            }
-        }
-
-        // torch_set - cuda_set
-        for (int32_t idx : torch_set) {
-            if (cuda_set.find(idx) == cuda_set.end()) {
-                if (idx < 0 || idx >= vocab_size) {
-                    std::cerr << "Invalid index " << idx
-                              << " in torch_set at row " << row_idx << std::endl;
-                    return false;
-                }
-                torch_only_values.push_back(logits_row[idx]);
-            }
-        }
-
-        if (cuda_only_values.size() != torch_only_values.size()) {
-            return false;
-        }
-
-        // 与 Python 版保持语义一致：比较“集合的值”，而不是顺序
-        std::sort(cuda_only_values.begin(), cuda_only_values.end());
-        std::sort(torch_only_values.begin(), torch_only_values.end());
-
-        if (!allclose_vec(cuda_only_values, torch_only_values,
-                          /*rtol=*/tolerance,
-                          /*atol=*/tolerance)) {
-            return false;
-        }
+    // 防御性检查：避免负数转成超大 size_t
+    if (row_length < 0) {
+      std::cerr << "Row " << row_idx
+                << " has negative length: row_end=" << row_end
+                << ", row_start=" << row_start << std::endl;
+      return false;
     }
 
-    return true;
+    int32_t num_valid = std::min(top_k, row_length);
+    if (num_valid <= 0) {
+      // 没有有效元素可以比，直接跳过
+      continue;
+    }
+
+    const int32_t *cuda_row = cuda_indices + row_idx * top_k;
+    const int32_t *torch_row = torch_indices + row_idx * top_k;
+
+    // 构建当前行的 index 集合
+    std::unordered_set<int32_t> cuda_set;
+    std::unordered_set<int32_t> torch_set;
+    cuda_set.reserve(num_valid);
+    torch_set.reserve(num_valid);
+
+    for (int32_t i = 0; i < num_valid; ++i) {
+      cuda_set.insert(cuda_row[i]);
+      torch_set.insert(torch_row[i]);
+    }
+
+    // index 集合完全一致，继续下一行
+    if (cuda_set == torch_set) {
+      continue;
+    }
+
+    // 有差异：取这些差异 index 对应的 logits
+    const float *logits_row = logits + row_idx * vocab_size;
+    std::vector<float> cuda_only_values;
+    std::vector<float> torch_only_values;
+    cuda_only_values.reserve(top_k);
+    torch_only_values.reserve(top_k);
+
+    // cuda_set - torch_set
+    for (int32_t idx : cuda_set) {
+      if (torch_set.find(idx) == torch_set.end()) {
+        // 防御性检查，避免 idx 越界
+        if (idx < 0 || idx >= vocab_size) {
+          std::cerr << "Invalid index " << idx << " in cuda_set at row "
+                    << row_idx << std::endl;
+          return false;
+        }
+        cuda_only_values.push_back(logits_row[idx]);
+      }
+    }
+
+    // torch_set - cuda_set
+    for (int32_t idx : torch_set) {
+      if (cuda_set.find(idx) == cuda_set.end()) {
+        if (idx < 0 || idx >= vocab_size) {
+          std::cerr << "Invalid index " << idx << " in torch_set at row "
+                    << row_idx << std::endl;
+          return false;
+        }
+        torch_only_values.push_back(logits_row[idx]);
+      }
+    }
+
+    if (cuda_only_values.size() != torch_only_values.size()) {
+      return false;
+    }
+
+    // 与 Python 版保持语义一致：比较“集合的值”，而不是顺序
+    std::sort(cuda_only_values.begin(), cuda_only_values.end());
+    std::sort(torch_only_values.begin(), torch_only_values.end());
+
+    if (!allclose_vec(cuda_only_values, torch_only_values,
+                      /*rtol=*/tolerance,
+                      /*atol=*/tolerance)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 // ============= main: 造数据+调 kernel =============
@@ -1655,6 +1792,17 @@ int main(int argc, char **argv) {
   create_random_logits(h_row_starts, h_row_ends, seed, data_generation,
                        h_logits, stride0, stride1);
 
+#if 0
+  // debug print
+  std::cout << "Sample logits:" << std::endl;
+  for (int i = 0; i < std::min(1, num_rows); ++i) {
+    std::cout << "Row " << i << ": ";
+    for (int j = 0; j < std::min(10000, stride0); ++j) {
+      printf("%f ", h_logits[i * stride0 + j]);
+    }
+    std::cout << std::endl;
+  }
+#endif
   const int32_t max_end = stride0; // 就是列数
   std::cout << "num_rows = " << num_rows << ", num_prefix = " << num_prefix
             << ", context_len = " << max_end << ", top_k = " << top_k
@@ -1695,7 +1843,7 @@ int main(int argc, char **argv) {
   HIP_CHECK(hipMalloc(&workspace, workspace_size));
 
   int n_warmup = 10;
-  int n_repeats = 100;
+  int n_repeats = 10;
   // warmup
   for (int i = 0; i < n_warmup; ++i) {
     invokeTopkLastDim<float>(num_rows, max_end, d_row_starts, d_row_ends, top_k,
@@ -1771,6 +1919,22 @@ int main(int argc, char **argv) {
     std::cout << "All checked results match!" << std::endl;
   } else {
     std::cout << "There were mismatches in the checked results." << std::endl;
+#if 1
+    // debug print
+    for (int32_t i = 0; i < std::min(1, num_rows); ++i) {
+      std::cout << "Row " << i << " CUDA indices: ";
+      for (int32_t j = 0; j < top_k; ++j) {
+        std::cout << h_indices[i * top_k + j] << " ";
+      }
+      std::cout << std::endl;
+
+      std::cout << "Row " << i << " Torch indices: ";
+      for (int32_t j = 0; j < top_k; ++j) {
+        std::cout << h_indices_ref[i * top_k + j] << " ";
+      }
+      std::cout << std::endl;
+    }
+#endif
   }
 
   // 7. 释放 device 内存
