@@ -1006,7 +1006,7 @@ __device__ void filter_and_histogram_for_one_block(
 
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
           bool WRITE_TOPK_VALUES, bool prioritize_smaller_indice = false>
-__global__ void
+__device__ void
 radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
                             const IdxT *rowStarts, const IdxT *rowEnds,
                             const IdxT k, T *out, IdxT *out_idx,
@@ -1105,7 +1105,7 @@ radix_topk_one_block_kernel(T const *in, IdxT const *in_idx, const int64_t len,
 
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
           bool WRITE_TOPK_VALUES, bool prioritize_smaller_indice = false>
-__global__ void radix_topk_one_block_one_pass_kernel(
+__device__ void radix_topk_one_block_one_pass_kernel(
     T const *in, IdxT const *in_idx, const int64_t len, const IdxT *rowStarts,
     const IdxT *rowEnds, const IdxT k, T *out, IdxT *out_idx,
     bool const select_min, char *bufs) {
@@ -1247,6 +1247,33 @@ __global__ void radix_topk_one_block_one_pass_kernel(
     }
   }
 }
+static inline __device__ uint32_t floatAsSortableUint(float x)
+{
+    uint32_t bits = __float_as_uint(x);
+    bits          = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+    return bits;
+}
+
+template <typename T, typename IdxT, int BitsPerPass, int BlockSize,
+          bool WRITE_TOPK_VALUES, bool prioritize_smaller_indice = false>
+__global__ void dispatch_radix_topk_one_block(
+    T const *in, IdxT const *in_idx, const int64_t len, const IdxT *rowStarts,
+    const IdxT *rowEnds, const IdxT k, T *out, IdxT *out_idx,
+    bool const select_min, char *bufs, T const *global_min_values, T const *global_max_values) {
+      auto global_min = floatAsSortableUint(global_min_values[0]);
+      auto global_max = floatAsSortableUint(global_max_values[0]);
+      uint32_t diff = global_min ^ global_max;
+      int msb_diff = 32 - __clz(diff);
+
+      if (msb_diff <= BitsPerPass){
+        radix_topk_one_block_one_pass_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, prioritize_smaller_indice>
+            (in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs);
+      }
+      else{
+        radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, prioritize_smaller_indice>
+            (in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs);
+      }
+    }
 
 inline size_t calc_aligned_size(std::vector<size_t> const &sizes) {
   const size_t ALIGN_BYTES = 256;
@@ -1394,11 +1421,11 @@ void standalone_stable_radix_topk_one_block_(
     topk_out_idx = static_cast<decltype(topk_out_idx)>(aligned_pointers[1]);
   }
 
-  radix_topk_one_block_one_pass_kernel<T, IdxT, BitsPerPass, BlockSize,
-                                       WRITE_TOPK_VALUES, false>
+  dispatch_radix_topk_one_block<T, IdxT, BitsPerPass, BlockSize,
+                              WRITE_TOPK_VALUES, false>
       <<<batch_size, BlockSize, 0, stream>>>(in, in_idx, len, rowStarts,
                                              rowEnds, k, out, out_idx,
-                                             select_min, bufs);
+                                             select_min, bufs, in, in);
 }
 
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES,
@@ -1413,7 +1440,7 @@ void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
   constexpr bool fused_last_filter = false;
 
   if (len <= block_dim * items_per_thread) {
-    standalone_stable_radix_topk_one_block_<T, IdxT, 10, block_dim,
+    standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
                                             WRITE_TOPK_VALUES>(
         buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
         rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
@@ -1429,16 +1456,17 @@ void standalone_stable_radix_11bits(void *buf, size_t &buf_size, T const *in,
     int sm_cnt = get_num_cu_local();
 
     unsigned grid_dim =
-        calc_grid_dim<T, IdxT, 10, block_dim, WRITE_TOPK_VALUES>(batch_size,
+        calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(batch_size,
                                                                  len, sm_cnt);
 
     if (grid_dim == 1) {
-      standalone_stable_radix_topk_one_block_<T, IdxT, 10, block_dim,
+      standalone_stable_radix_topk_one_block_<T, IdxT, 11, block_dim,
                                               WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
           rowStarts, rowEnds, k, out, out_idx, !greater, stream, sorted);
 
-        // std::cout << "Warning: using one-block topk even len > block_dim * items_per_thread" << std::endl;
+      // std::cout << "Warning: using one-block topk even len > block_dim *
+      // items_per_thread" << std::endl;
     } else {
       standalone_stable_radix_topk_<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES>(
           buf, buf_size, in, static_cast<IdxT *>(nullptr), batch_size, len,
